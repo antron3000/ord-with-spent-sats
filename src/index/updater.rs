@@ -422,6 +422,7 @@ impl Updater<'_> {
       wtx.open_table(INSCRIPTION_NUMBER_TO_SEQUENCE_NUMBER)?;
     let mut latest_child_to_collection =
       wtx.open_multimap_table(LATEST_CHILD_SEQUENCE_NUMBER_TO_COLLECTION_SEQUENCE_NUMBER)?;
+    let mut outpoint_to_spent_sat_ranges = wtx.open_table(OUTPOINT_TO_SPENT_SAT_RANGES)?;
     let mut outpoint_to_utxo_entry = wtx.open_table(OUTPOINT_TO_UTXO_ENTRY)?;
     let mut sat_to_satpoint = wtx.open_table(SAT_TO_SATPOINT)?;
     let mut sat_to_sequence_number = wtx.open_multimap_table(SAT_TO_SEQUENCE_NUMBER)?;
@@ -598,6 +599,16 @@ impl Updater<'_> {
         .iter()
         .map(|entry| entry.parse(self.index))
         .collect::<Vec<ParsedUtxoEntry>>();
+
+      if self.index.index_spent_sats && self.index.index_sats && tx_offset != 0 {
+        for (i, parsed_entry) in input_utxo_entries.iter().enumerate() {
+          let spent_outpoint = tx.input[i].previous_output;
+          let sat_ranges = parsed_entry.sat_ranges();
+          if !sat_ranges.is_empty() {
+            outpoint_to_spent_sat_ranges.insert(&spent_outpoint.store(), sat_ranges)?;
+          }
+        }
+      }
 
       let mut output_utxo_entries = tx
         .output

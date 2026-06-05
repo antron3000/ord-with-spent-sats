@@ -60,6 +60,8 @@ pub struct Options {
   pub(crate) index_runes: bool,
   #[arg(long, help = "Track location of all satoshis.")]
   pub(crate) index_sats: bool,
+  #[arg(long, help = "Store sat ranges for spent outputs. Requires --index-sats.")]
+  pub(crate) index_spent_sats: bool,
   #[arg(long, help = "Store transactions in index.")]
   pub(crate) index_transactions: bool,
   #[arg(long, help = "Run in integration test mode.")]

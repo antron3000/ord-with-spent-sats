@@ -68,6 +68,7 @@ define_table! { INSCRIPTION_ID_TO_SEQUENCE_NUMBER, InscriptionIdValue, u32 }
 define_table! { INSCRIPTION_NUMBER_TO_SEQUENCE_NUMBER, i32, u32 }
 define_table! { NUMBER_TO_OFFER, u64, &[u8] }
 define_table! { OUTPOINT_TO_RUNE_BALANCES, &OutPointValue, &[u8] }
+define_table! { OUTPOINT_TO_SPENT_SAT_RANGES, &OutPointValue, &[u8] }
 define_table! { OUTPOINT_TO_UTXO_ENTRY, &OutPointValue, &UtxoEntry }
 define_table! { RUNE_ID_TO_RUNE_ENTRY, RuneIdValue, RuneEntryValue }
 define_table! { RUNE_TO_RUNE_ID, u128, RuneIdValue }
@@ -90,6 +91,7 @@ pub(crate) enum Statistic {
   IndexInscriptions = 5,
   IndexRunes = 6,
   IndexSats = 7,
+  IndexSpentSats = 18,
   IndexTransactions = 8,
   InitialSyncTime = 9,
   LostSats = 10,
@@ -210,6 +212,7 @@ pub struct Index {
   index_inscriptions: bool,
   index_runes: bool,
   index_sats: bool,
+  index_spent_sats: bool,
   index_transactions: bool,
   path: PathBuf,
   settings: Settings,
@@ -299,6 +302,7 @@ impl Index {
         let tx = database.begin_write()?;
 
         tx.open_table(NUMBER_TO_OFFER)?;
+        tx.open_table(OUTPOINT_TO_SPENT_SAT_RANGES)?;
 
         tx.commit()?;
 
@@ -331,6 +335,7 @@ impl Index {
         tx.open_table(INSCRIPTION_NUMBER_TO_SEQUENCE_NUMBER)?;
         tx.open_table(NUMBER_TO_OFFER)?;
         tx.open_table(OUTPOINT_TO_RUNE_BALANCES)?;
+        tx.open_table(OUTPOINT_TO_SPENT_SAT_RANGES)?;
         tx.open_table(OUTPOINT_TO_UTXO_ENTRY)?;
         tx.open_table(RUNE_ID_TO_RUNE_ENTRY)?;
         tx.open_table(RUNE_TO_RUNE_ID)?;
@@ -366,6 +371,12 @@ impl Index {
             &mut statistics,
             Statistic::IndexSats,
             u64::from(settings.index_sats_raw()),
+          )?;
+
+          Self::set_statistic(
+            &mut statistics,
+            Statistic::IndexSpentSats,
+            u64::from(settings.index_spent_sats_raw()),
           )?;
 
           Self::set_statistic(
@@ -431,6 +442,7 @@ impl Index {
     let index_addresses;
     let index_runes;
     let index_sats;
+    let index_spent_sats;
     let index_transactions;
     let index_inscriptions;
 
@@ -441,6 +453,7 @@ impl Index {
       index_inscriptions = Self::is_statistic_set(&statistics, Statistic::IndexInscriptions)?;
       index_runes = Self::is_statistic_set(&statistics, Statistic::IndexRunes)?;
       index_sats = Self::is_statistic_set(&statistics, Statistic::IndexSats)?;
+      index_spent_sats = Self::is_statistic_set(&statistics, Statistic::IndexSpentSats)?;
       index_transactions = Self::is_statistic_set(&statistics, Statistic::IndexTransactions)?;
     }
 
@@ -469,6 +482,7 @@ impl Index {
       index_addresses,
       index_runes,
       index_sats,
+      index_spent_sats,
       index_transactions,
       index_inscriptions,
       settings: settings.clone(),
@@ -526,6 +540,10 @@ impl Index {
 
   pub fn has_sat_index(&self) -> bool {
     self.index_sats
+  }
+
+  pub fn has_spent_sat_index(&self) -> bool {
+    self.index_spent_sats
   }
 
   pub fn status(&self, json_api: bool) -> Result<StatusHtml> {
@@ -1933,6 +1951,27 @@ impl Index {
     )
   }
 
+  pub fn list_spent(&self, outpoint: OutPoint) -> Result<Option<Vec<(u64, u64)>>> {
+    if !self.index_spent_sats {
+      return Ok(None);
+    }
+
+    Ok(
+      self
+        .database
+        .begin_read()?
+        .open_table(OUTPOINT_TO_SPENT_SAT_RANGES)?
+        .get(&outpoint.store())?
+        .map(|sat_ranges| {
+          sat_ranges
+            .value()
+            .chunks_exact(11)
+            .map(|chunk| SatRange::load(chunk.try_into().unwrap()))
+            .collect::<Vec<(u64, u64)>>()
+        }),
+    )
+  }
+
   pub fn is_output_spent(&self, outpoint: OutPoint) -> Result<bool> {
     Ok(
       outpoint != OutPoint::null()
@@ -2603,7 +2642,7 @@ impl Index {
   }
 
   pub(crate) fn get_output_info(&self, outpoint: OutPoint) -> Result<Option<(api::Output, TxOut)>> {
-    let sat_ranges = self.list(outpoint)?;
+    let mut sat_ranges = self.list(outpoint)?;
 
     let confirmations;
     let indexed;
@@ -2651,6 +2690,10 @@ impl Index {
           value: output.value,
           script_pubkey: ScriptBuf::from_bytes(output.script_pub_key.hex),
         };
+
+        if sat_ranges.is_none() {
+          sat_ranges = self.list_spent(outpoint)?;
+        }
       }
     };
 

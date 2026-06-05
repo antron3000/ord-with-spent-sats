@@ -22,6 +22,7 @@ pub struct Settings {
   index_cache_size: Option<usize>,
   index_runes: bool,
   index_sats: bool,
+  index_spent_sats: bool,
   index_transactions: bool,
   integration_test: bool,
   max_savepoints: Option<usize>,
@@ -137,6 +138,7 @@ impl Settings {
       index_cache_size: self.index_cache_size.or(source.index_cache_size),
       index_runes: self.index_runes || source.index_runes,
       index_sats: self.index_sats || source.index_sats,
+      index_spent_sats: self.index_spent_sats || source.index_spent_sats,
       index_transactions: self.index_transactions || source.index_transactions,
       integration_test: self.integration_test || source.integration_test,
       max_savepoints: self.max_savepoints.or(source.max_savepoints),
@@ -175,6 +177,7 @@ impl Settings {
       index_cache_size: options.index_cache_size,
       index_runes: options.index_runes,
       index_sats: options.index_sats,
+      index_spent_sats: options.index_spent_sats,
       index_transactions: options.index_transactions,
       integration_test: options.integration_test,
       max_savepoints: options.max_savepoints,
@@ -265,6 +268,7 @@ impl Settings {
       index_cache_size: get_usize("INDEX_CACHE_SIZE")?,
       index_runes: get_bool("INDEX_RUNES"),
       index_sats: get_bool("INDEX_SATS"),
+      index_spent_sats: get_bool("INDEX_SPENT_SATS"),
       index_transactions: get_bool("INDEX_TRANSACTIONS"),
       integration_test: get_bool("INTEGRATION_TEST"),
       max_savepoints: get_usize("MAX_SAVEPOINTS")?,
@@ -297,6 +301,7 @@ impl Settings {
       index_cache_size: None,
       index_runes: true,
       index_sats: true,
+      index_spent_sats: false,
       index_transactions: false,
       integration_test: false,
       max_savepoints: None,
@@ -341,6 +346,10 @@ impl Settings {
       None => data_dir.join("index.redb"),
     };
 
+    if self.index_spent_sats && !self.index_sats {
+      bail!("--index-spent-sats requires --index-sats");
+    }
+
     Ok(Self {
       bitcoin_data_dir: Some(bitcoin_data_dir),
       bitcoin_rpc_limit: Some(self.bitcoin_rpc_limit.unwrap_or(12)),
@@ -373,6 +382,7 @@ impl Settings {
       }),
       index_runes: self.index_runes,
       index_sats: self.index_sats,
+      index_spent_sats: self.index_spent_sats,
       index_transactions: self.index_transactions,
       integration_test: self.integration_test,
       max_savepoints: Some(self.max_savepoints.unwrap_or(2)),
@@ -566,6 +576,10 @@ impl Settings {
 
   pub fn index_sats_raw(&self) -> bool {
     self.index_sats
+  }
+
+  pub fn index_spent_sats_raw(&self) -> bool {
+    self.index_spent_sats
   }
 
   pub fn index_transactions_raw(&self) -> bool {
