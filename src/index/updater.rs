@@ -743,6 +743,9 @@ impl Updater<'_> {
       }
 
       let mut new_utxo_entry = UtxoEntryBuf::new();
+      if self.index.index_spent_sats {
+        new_utxo_entry.push_output_id(0, self.index);
+      }
       new_utxo_entry.push_sat_ranges(&lost_sat_ranges, self.index);
       if self.index.index_addresses {
         new_utxo_entry.push_script_pubkey(&[], self.index);
