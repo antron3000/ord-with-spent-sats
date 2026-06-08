@@ -45,10 +45,15 @@ impl UtxoEntry {
     let sats;
     let mut script_pubkey = None;
     let mut inscriptions = None;
+    let mut output_id = None;
 
     let mut offset = 0;
+    if index.index_spent_sats {
+      output_id = Some(u64::from_le_bytes(self.bytes[offset..offset + 8].try_into().unwrap()));
+      offset += 8;
+    }
     if index.index_sats {
-      let (num_sat_ranges, varint_len) = varint::decode(&self.bytes).unwrap();
+      let (num_sat_ranges, varint_len) = varint::decode(&self.bytes[offset..]).unwrap();
       offset += varint_len;
 
       let num_sat_ranges: usize = num_sat_ranges.try_into().unwrap();
@@ -56,7 +61,7 @@ impl UtxoEntry {
       sats = Sats::Ranges(&self.bytes[offset..offset + sat_ranges_len]);
       offset += sat_ranges_len;
     } else {
-      let (value, varint_len) = varint::decode(&self.bytes).unwrap();
+      let (value, varint_len) = varint::decode(&self.bytes[offset..]).unwrap();
       sats = Sats::Value(value.try_into().unwrap());
       offset += varint_len;
     };
@@ -78,6 +83,7 @@ impl UtxoEntry {
       sats,
       script_pubkey,
       inscriptions,
+      output_id,
     }
   }
 
@@ -129,6 +135,7 @@ pub struct ParsedUtxoEntry<'a> {
   sats: Sats<'a>,
   script_pubkey: Option<&'a [u8]>,
   inscriptions: Option<&'a [u8]>,
+  output_id: Option<u64>,
 }
 
 impl<'a> ParsedUtxoEntry<'a> {
@@ -144,6 +151,10 @@ impl<'a> ParsedUtxoEntry<'a> {
         value
       }
     }
+  }
+
+  pub fn output_id(&self) -> u64 {
+    self.output_id.unwrap()
   }
 
   pub fn sat_ranges(&self) -> &'a [u8] {
@@ -209,6 +220,11 @@ impl UtxoEntryBuf {
     }
   }
 
+  pub fn push_output_id(&mut self, id: u64, index: &Index) {
+    assert!(index.index_spent_sats);
+    self.vec.extend(id.to_le_bytes());
+  }
+
   pub fn push_value(&mut self, value: u64, index: &Index) {
     assert!(!index.index_sats);
     varint::encode_to_vec(value.into(), &mut self.vec);
@@ -269,6 +285,10 @@ impl UtxoEntryBuf {
     let b_parsed = b.parse(index);
     let mut merged = Self::new();
 
+    if index.index_spent_sats {
+      merged.push_output_id(0, index);
+    }
+
     if index.index_sats {
       let sat_ranges = [a_parsed.sat_ranges(), b_parsed.sat_ranges()].concat();
       merged.push_sat_ranges(&sat_ranges, index);
@@ -294,6 +314,10 @@ impl UtxoEntryBuf {
 
   pub fn empty(index: &Index) -> Self {
     let mut utxo_entry = Self::new();
+
+    if index.index_spent_sats {
+      utxo_entry.push_output_id(0, index);
+    }
 
     if index.index_sats {
       utxo_entry.push_sat_ranges(&[], index);

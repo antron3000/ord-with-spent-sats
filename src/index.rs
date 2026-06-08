@@ -34,7 +34,7 @@ use {
   },
   std::{
     collections::HashMap,
-    io::{BufWriter, Write},
+    io::{BufWriter, Read, Seek, SeekFrom, Write},
     sync::Once,
   },
 };
@@ -68,7 +68,7 @@ define_table! { INSCRIPTION_ID_TO_SEQUENCE_NUMBER, InscriptionIdValue, u32 }
 define_table! { INSCRIPTION_NUMBER_TO_SEQUENCE_NUMBER, i32, u32 }
 define_table! { NUMBER_TO_OFFER, u64, &[u8] }
 define_table! { OUTPOINT_TO_RUNE_BALANCES, &OutPointValue, &[u8] }
-define_table! { OUTPOINT_TO_SPENT_SAT_RANGES, &OutPointValue, &[u8] }
+define_table! { HEIGHT_TO_FIRST_OUTPUT_ID, u32, u64 }
 define_table! { OUTPOINT_TO_UTXO_ENTRY, &OutPointValue, &UtxoEntry }
 define_table! { RUNE_ID_TO_RUNE_ENTRY, RuneIdValue, RuneEntryValue }
 define_table! { RUNE_TO_RUNE_ID, u128, RuneIdValue }
@@ -93,6 +93,8 @@ pub(crate) enum Statistic {
   IndexSats = 7,
   IndexSpentSats = 18,
   IndexTransactions = 8,
+  SpentSatRangesFileLength = 19,
+  TotalOutputs = 20,
   InitialSyncTime = 9,
   LostSats = 10,
   OutputsTraversed = 11,
@@ -215,6 +217,8 @@ pub struct Index {
   index_spent_sats: bool,
   index_transactions: bool,
   path: PathBuf,
+  spent_sat_ranges_path: PathBuf,
+  spent_sat_offsets_path: PathBuf,
   settings: Settings,
   started: DateTime<Utc>,
   first_index_height: u32,
@@ -302,7 +306,7 @@ impl Index {
         let tx = database.begin_write()?;
 
         tx.open_table(NUMBER_TO_OFFER)?;
-        tx.open_table(OUTPOINT_TO_SPENT_SAT_RANGES)?;
+        tx.open_table(HEIGHT_TO_FIRST_OUTPUT_ID)?;
 
         tx.commit()?;
 
@@ -335,7 +339,7 @@ impl Index {
         tx.open_table(INSCRIPTION_NUMBER_TO_SEQUENCE_NUMBER)?;
         tx.open_table(NUMBER_TO_OFFER)?;
         tx.open_table(OUTPOINT_TO_RUNE_BALANCES)?;
-        tx.open_table(OUTPOINT_TO_SPENT_SAT_RANGES)?;
+        tx.open_table(HEIGHT_TO_FIRST_OUTPUT_ID)?;
         tx.open_table(OUTPOINT_TO_UTXO_ENTRY)?;
         tx.open_table(RUNE_ID_TO_RUNE_ENTRY)?;
         tx.open_table(RUNE_TO_RUNE_ID)?;
@@ -470,6 +474,9 @@ impl Index {
       u32::MAX
     };
 
+    let spent_sat_ranges_path = path.with_extension("spent-sat-ranges");
+    let spent_sat_offsets_path = path.with_extension("spent-sat-offsets");
+
     Ok(Self {
       genesis_block_coinbase_txid: genesis_block_coinbase_transaction.compute_txid(),
       client,
@@ -487,6 +494,8 @@ impl Index {
       index_inscriptions,
       settings: settings.clone(),
       path,
+      spent_sat_ranges_path,
+      spent_sat_offsets_path,
       started: Utc::now(),
       unrecoverably_reorged: AtomicBool::new(false),
     })
@@ -695,6 +704,11 @@ impl Index {
           .next_back()
           .transpose()?
           .map(|(height, _header)| height.value() + 1)
+          .unwrap_or(0),
+        total_outputs: wtx
+          .open_table(STATISTIC_TO_COUNT)?
+          .get(&Statistic::TotalOutputs.key())?
+          .map(|x| x.value())
           .unwrap_or(0),
         index: self,
         outputs_cached: 0,
@@ -1956,20 +1970,93 @@ impl Index {
       return Ok(None);
     }
 
-    Ok(
-      self
-        .database
-        .begin_read()?
-        .open_table(OUTPOINT_TO_SPENT_SAT_RANGES)?
-        .get(&outpoint.store())?
-        .map(|sat_ranges| {
-          sat_ranges
-            .value()
-            .chunks_exact(11)
-            .map(|chunk| SatRange::load(chunk.try_into().unwrap()))
-            .collect::<Vec<(u64, u64)>>()
-        }),
-    )
+    // Get the creating transaction's block info
+    let Some(tx_info) = self.client.get_raw_transaction_info(&outpoint.txid, None).into_option()? else {
+      return Ok(None);
+    };
+
+    let Some(block_hash) = tx_info.blockhash else {
+      return Ok(None);
+    };
+
+    // Get block height
+    let Some(header_info) = self.client.get_block_header_info(&block_hash).into_option()? else {
+      return Ok(None);
+    };
+    let height = u32::try_from(header_info.height).unwrap();
+
+    // Look up base output ID for this block height
+    let rtx = self.database.begin_read()?;
+    let height_to_first = rtx.open_table(HEIGHT_TO_FIRST_OUTPUT_ID)?;
+    let Some(base_id) = height_to_first.get(&height)?.map(|g| g.value()) else {
+      return Ok(None);
+    };
+
+    // Get full block to find tx position and count outputs
+    let Some(block) = self.client.get_block(&block_hash).into_option()? else {
+      return Ok(None);
+    };
+
+    // Iterate in the same order as the updater: non-coinbase first, coinbase last
+    let mut output_id = base_id;
+    let mut found = false;
+    for block_tx in block.txdata.iter().skip(1).chain(block.txdata.iter().take(1)) {
+      let block_txid = block_tx.compute_txid();
+      if block_txid == outpoint.txid {
+        output_id += u64::from(outpoint.vout);
+        found = true;
+        break;
+      }
+      output_id += block_tx.output.len() as u64;
+    }
+
+    if !found {
+      return Ok(None);
+    }
+
+    // Read offset from the offset array file
+    if !self.spent_sat_offsets_path.exists() {
+      return Ok(None);
+    }
+
+    let mut offsets_file = fs::File::open(&self.spent_sat_offsets_path)?;
+    let file_len = offsets_file.metadata()?.len();
+    let seek_pos = output_id * 8;
+    if seek_pos + 8 > file_len {
+      return Ok(None);
+    }
+
+    offsets_file.seek(SeekFrom::Start(seek_pos))?;
+    let mut offset_buf = [0u8; 8];
+    offsets_file.read_exact(&mut offset_buf)?;
+    let offset_plus_one = u64::from_le_bytes(offset_buf);
+
+    if offset_plus_one == 0 {
+      return Ok(None);
+    }
+
+    let data_offset = offset_plus_one - 1;
+
+    // Read sat ranges from data file
+    let mut data_file = fs::File::open(&self.spent_sat_ranges_path)?;
+    if data_offset >= data_file.metadata()?.len() {
+      return Ok(None);
+    }
+    data_file.seek(SeekFrom::Start(data_offset))?;
+
+    let mut count_buf = [0u8; 2];
+    data_file.read_exact(&mut count_buf)?;
+    let count = u16::from_le_bytes(count_buf) as usize;
+
+    let mut ranges_buf = vec![0u8; count * 11];
+    data_file.read_exact(&mut ranges_buf)?;
+
+    Ok(Some(
+      ranges_buf
+        .chunks_exact(11)
+        .map(|chunk| SatRange::load(chunk.try_into().unwrap()))
+        .collect(),
+    ))
   }
 
   pub fn is_output_spent(&self, outpoint: OutPoint) -> Result<bool> {

@@ -65,6 +65,38 @@ impl Reorg {
 
     wtx.restore_savepoint(&oldest_savepoint)?;
 
+    if index.index_spent_sats {
+      let statistics = wtx.open_table(STATISTIC_TO_COUNT)?;
+
+      let data_file_len = statistics
+        .get(&Statistic::SpentSatRangesFileLength.key())?
+        .map(|x| x.value())
+        .unwrap_or(0);
+
+      let total_outputs = statistics
+        .get(&Statistic::TotalOutputs.key())?
+        .map(|x| x.value())
+        .unwrap_or(0);
+
+      drop(statistics);
+
+      if index.spent_sat_ranges_path.exists() {
+        let file = fs::OpenOptions::new()
+          .write(true)
+          .open(&index.spent_sat_ranges_path)?;
+        file.set_len(data_file_len)?;
+        log::info!("truncated spent sat ranges data file to {data_file_len} bytes");
+      }
+
+      if index.spent_sat_offsets_path.exists() {
+        let file = fs::OpenOptions::new()
+          .write(true)
+          .open(&index.spent_sat_offsets_path)?;
+        file.set_len(total_outputs * 8)?;
+        log::info!("truncated spent sat offsets file to {} bytes", total_outputs * 8);
+      }
+    }
+
     Index::increment_statistic(&wtx, Statistic::Commits, 1)?;
     wtx.commit()?;
 

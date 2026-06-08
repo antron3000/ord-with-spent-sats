@@ -2,6 +2,7 @@ use {
   self::{inscription_updater::InscriptionUpdater, rune_updater::RuneUpdater},
   super::{fetcher::Fetcher, *},
   futures::future::try_join_all,
+  std::io::{Seek, SeekFrom, Write},
   tokio::sync::{
     broadcast::{self, error::TryRecvError},
     mpsc::{self},
@@ -38,6 +39,7 @@ pub(crate) struct Updater<'index> {
   pub(super) outputs_cached: u64,
   pub(super) outputs_traversed: u64,
   pub(super) sat_ranges_since_flush: u64,
+  pub(super) total_outputs: u64,
 }
 
 impl Updater<'_> {
@@ -422,7 +424,7 @@ impl Updater<'_> {
       wtx.open_table(INSCRIPTION_NUMBER_TO_SEQUENCE_NUMBER)?;
     let mut latest_child_to_collection =
       wtx.open_multimap_table(LATEST_CHILD_SEQUENCE_NUMBER_TO_COLLECTION_SEQUENCE_NUMBER)?;
-    let mut outpoint_to_spent_sat_ranges = wtx.open_table(OUTPOINT_TO_SPENT_SAT_RANGES)?;
+    let mut height_to_first_output_id = wtx.open_table(HEIGHT_TO_FIRST_OUTPUT_ID)?;
     let mut outpoint_to_utxo_entry = wtx.open_table(OUTPOINT_TO_UTXO_ENTRY)?;
     let mut sat_to_satpoint = wtx.open_table(SAT_TO_SATPOINT)?;
     let mut sat_to_sequence_number = wtx.open_multimap_table(SAT_TO_SEQUENCE_NUMBER)?;
@@ -543,6 +545,27 @@ impl Updater<'_> {
       }
     }
 
+    if self.index.index_spent_sats {
+      height_to_first_output_id.insert(&self.height, self.total_outputs)?;
+    }
+
+    let mut spent_data_file = if self.index.index_spent_sats && self.index.index_sats {
+      Some(fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&self.index.spent_sat_ranges_path)?)
+    } else {
+      None
+    };
+    let mut spent_offsets_file = if self.index.index_spent_sats && self.index.index_sats {
+      Some(fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&self.index.spent_sat_offsets_path)?)
+    } else {
+      None
+    };
+
     for (tx_offset, (tx, txid)) in block
       .txdata
       .iter()
@@ -600,12 +623,22 @@ impl Updater<'_> {
         .map(|entry| entry.parse(self.index))
         .collect::<Vec<ParsedUtxoEntry>>();
 
-      if self.index.index_spent_sats && self.index.index_sats && tx_offset != 0 {
-        for (i, parsed_entry) in input_utxo_entries.iter().enumerate() {
-          let spent_outpoint = tx.input[i].previous_output;
-          let sat_ranges = parsed_entry.sat_ranges();
-          if !sat_ranges.is_empty() {
-            outpoint_to_spent_sat_ranges.insert(&spent_outpoint.store(), sat_ranges)?;
+      if let (Some(data_file), Some(offsets_file)) =
+        (spent_data_file.as_mut(), spent_offsets_file.as_mut())
+      {
+        if tx_offset != 0 {
+          for parsed_entry in input_utxo_entries.iter() {
+            let sat_ranges = parsed_entry.sat_ranges();
+            if !sat_ranges.is_empty() {
+              let output_id = parsed_entry.output_id();
+              let data_offset = data_file.seek(SeekFrom::End(0))?;
+              let count = (sat_ranges.len() / 11) as u16;
+              data_file.write_all(&count.to_le_bytes())?;
+              data_file.write_all(sat_ranges)?;
+              // Store offset+1 so that 0 means "no data"
+              offsets_file.seek(SeekFrom::Start(output_id * 8))?;
+              offsets_file.write_all(&(data_offset + 1).to_le_bytes())?;
+            }
           }
         }
       }
@@ -615,6 +648,13 @@ impl Updater<'_> {
         .iter()
         .map(|_| UtxoEntryBuf::new())
         .collect::<Vec<UtxoEntryBuf>>();
+
+      if self.index.index_spent_sats {
+        for entry in output_utxo_entries.iter_mut() {
+          entry.push_output_id(self.total_outputs, self.index);
+          self.total_outputs += 1;
+        }
+      }
 
       let input_sat_ranges;
       if self.index.index_sats {
@@ -875,6 +915,25 @@ impl Updater<'_> {
           }
         }
       }
+    }
+
+    if self.index.index_spent_sats {
+      let file_len = if self.index.spent_sat_ranges_path.exists() {
+        fs::metadata(&self.index.spent_sat_ranges_path)?.len()
+      } else {
+        0
+      };
+      let mut statistic_to_count = wtx.open_table(STATISTIC_TO_COUNT)?;
+      Index::set_statistic(
+        &mut statistic_to_count,
+        Statistic::SpentSatRangesFileLength,
+        file_len,
+      )?;
+      Index::set_statistic(
+        &mut statistic_to_count,
+        Statistic::TotalOutputs,
+        self.total_outputs,
+      )?;
     }
 
     Index::increment_statistic(&wtx, Statistic::OutputsTraversed, self.outputs_traversed)?;
