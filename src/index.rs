@@ -81,6 +81,43 @@ define_table! { TRANSACTION_ID_TO_RUNE, &TxidValue, u128 }
 define_table! { TRANSACTION_ID_TO_TRANSACTION, &TxidValue, &[u8] }
 define_table! { WRITE_TRANSACTION_STARTING_BLOCK_COUNT_TO_TIMESTAMP, u32, u128 }
 
+pub(crate) fn encode_sat_ranges_delta(raw_ranges: &[u8]) -> Vec<u8> {
+  let mut ranges: Vec<(u64, u64)> = raw_ranges
+    .chunks_exact(11)
+    .map(|chunk| SatRange::load(chunk.try_into().unwrap()))
+    .collect();
+
+  ranges.sort_unstable_by_key(|&(start, _)| start);
+
+  let mut out = Vec::new();
+  let mut prev_end = 0u64;
+  for (start, end) in ranges {
+    let gap = start - prev_end;
+    let length = end - start;
+    varint::encode_to_vec(gap.into(), &mut out);
+    varint::encode_to_vec(length.into(), &mut out);
+    prev_end = end;
+  }
+  out
+}
+
+pub(crate) fn decode_sat_ranges_delta(data: &[u8]) -> Vec<(u64, u64)> {
+  let mut ranges = Vec::new();
+  let mut offset = 0;
+  let mut prev_end = 0u64;
+  while offset < data.len() {
+    let (gap, len1) = varint::decode(&data[offset..]).unwrap();
+    offset += len1;
+    let (length, len2) = varint::decode(&data[offset..]).unwrap();
+    offset += len2;
+    let start = prev_end + u64::try_from(gap).unwrap();
+    let end = start + u64::try_from(length).unwrap();
+    ranges.push((start, end));
+    prev_end = end;
+  }
+  ranges
+}
+
 #[derive(Copy, Clone)]
 pub(crate) enum Statistic {
   Schema = 0,
@@ -2048,27 +2085,22 @@ impl Index {
     data_file.read_exact(&mut len_buf)?;
     let compressed_len = u32::from_le_bytes(len_buf) as usize;
 
-    let ranges_buf = if compressed_len > 0 {
-      // Compressed format
+    let delta_data = if compressed_len > 0 {
+      // Compressed delta-varint
       let mut compressed = vec![0u8; compressed_len];
       data_file.read_exact(&mut compressed)?;
       zstd::bulk::decompress(&compressed, 16 * 1024 * 1024)?
     } else {
-      // Uncompressed format: [u16 count][raw ranges]
-      let mut count_buf = [0u8; 2];
-      data_file.read_exact(&mut count_buf)?;
-      let count = u16::from_le_bytes(count_buf) as usize;
-      let mut buf = vec![0u8; count * 11];
+      // Uncompressed delta-varint: [u16 byte_len][delta-varint data]
+      let mut len_buf2 = [0u8; 2];
+      data_file.read_exact(&mut len_buf2)?;
+      let byte_len = u16::from_le_bytes(len_buf2) as usize;
+      let mut buf = vec![0u8; byte_len];
       data_file.read_exact(&mut buf)?;
       buf
     };
 
-    Ok(Some(
-      ranges_buf
-        .chunks_exact(11)
-        .map(|chunk| SatRange::load(chunk.try_into().unwrap()))
-        .collect(),
-    ))
+    Ok(Some(decode_sat_ranges_delta(&delta_data)))
   }
 
   pub fn is_output_spent(&self, outpoint: OutPoint) -> Result<bool> {

@@ -632,19 +632,19 @@ impl Updater<'_> {
             if !sat_ranges.is_empty() {
               let output_id = parsed_entry.output_id();
               let data_offset = data_file.seek(SeekFrom::End(0))?;
-              let num_ranges = sat_ranges.len() / 11;
-              if num_ranges > 5 {
-                // Compressed: [u32 compressed_len][compressed data]
-                let compressed = zstd::bulk::compress(sat_ranges, 3)?;
+              let encoded = encode_sat_ranges_delta(sat_ranges);
+              if encoded.len() > 50 {
+                // Compressed: [u32 compressed_len > 0][zstd compressed delta-varint]
+                let compressed = zstd::bulk::compress(&encoded, 3)?;
                 let compressed_len = u32::try_from(compressed.len()).unwrap();
                 data_file.write_all(&compressed_len.to_le_bytes())?;
                 data_file.write_all(&compressed)?;
               } else {
-                // Uncompressed: [u32 0][u16 count][raw ranges]
+                // Uncompressed: [u32 0][u16 byte_len][delta-varint data]
                 data_file.write_all(&0u32.to_le_bytes())?;
-                let count = num_ranges as u16;
-                data_file.write_all(&count.to_le_bytes())?;
-                data_file.write_all(sat_ranges)?;
+                let byte_len = encoded.len() as u16;
+                data_file.write_all(&byte_len.to_le_bytes())?;
+                data_file.write_all(&encoded)?;
               }
               // Store offset+1 so that 0 means "no data"
               offsets_file.seek(SeekFrom::Start(output_id * 8))?;
