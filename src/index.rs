@@ -2044,12 +2044,24 @@ impl Index {
     }
     data_file.seek(SeekFrom::Start(data_offset))?;
 
-    let mut count_buf = [0u8; 2];
-    data_file.read_exact(&mut count_buf)?;
-    let count = u16::from_le_bytes(count_buf) as usize;
+    let mut len_buf = [0u8; 4];
+    data_file.read_exact(&mut len_buf)?;
+    let compressed_len = u32::from_le_bytes(len_buf) as usize;
 
-    let mut ranges_buf = vec![0u8; count * 11];
-    data_file.read_exact(&mut ranges_buf)?;
+    let ranges_buf = if compressed_len > 0 {
+      // Compressed format
+      let mut compressed = vec![0u8; compressed_len];
+      data_file.read_exact(&mut compressed)?;
+      zstd::bulk::decompress(&compressed, 16 * 1024 * 1024)?
+    } else {
+      // Uncompressed format: [u16 count][raw ranges]
+      let mut count_buf = [0u8; 2];
+      data_file.read_exact(&mut count_buf)?;
+      let count = u16::from_le_bytes(count_buf) as usize;
+      let mut buf = vec![0u8; count * 11];
+      data_file.read_exact(&mut buf)?;
+      buf
+    };
 
     Ok(Some(
       ranges_buf
