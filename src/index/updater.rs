@@ -894,12 +894,18 @@ impl Updater<'_> {
     wtx: WriteTransaction,
     utxo_cache: HashMap<OutPoint, UtxoEntryBuf>,
   ) -> Result {
+    let spent_file_size = if self.index.index_spent_sats && self.index.spent_sat_ranges_path.exists() {
+      fs::metadata(&self.index.spent_sat_ranges_path).map(|m| m.len()).unwrap_or(0)
+    } else {
+      0
+    };
     log::info!(
-      "Committing at block height {}, {} outputs traversed, {} in map, {} cached",
+      "Committing at block height {}, {} outputs traversed, {} in map, {} cached, spent ranges file: {:.2} GB",
       self.height,
       self.outputs_traversed,
       utxo_cache.len(),
-      self.outputs_cached
+      self.outputs_cached,
+      spent_file_size as f64 / (1024.0 * 1024.0 * 1024.0)
     );
 
     {

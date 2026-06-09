@@ -89,9 +89,21 @@ pub(crate) fn encode_sat_ranges_delta(raw_ranges: &[u8]) -> Vec<u8> {
 
   ranges.sort_unstable_by_key(|&(start, _)| start);
 
+  // Merge adjacent/overlapping ranges
+  let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+  for (start, end) in ranges {
+    if let Some(last) = merged.last_mut() {
+      if start <= last.1 {
+        last.1 = last.1.max(end);
+        continue;
+      }
+    }
+    merged.push((start, end));
+  }
+
   let mut out = Vec::new();
   let mut prev_end = 0u64;
-  for (start, end) in ranges {
+  for (start, end) in merged {
     let gap = start - prev_end;
     let length = end - start;
     varint::encode_to_vec(gap.into(), &mut out);
